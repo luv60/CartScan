@@ -1,0 +1,1925 @@
+﻿import asyncio
+import logging
+import re
+import urllib.parse
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, Query, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from curl_cffi import requests
+from thefuzz import fuzz
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("aggregator")
+
+app = FastAPI(title="Live Quick Commerce Price Aggregator", version="4.0.0")
+
+# Setup CORS allowing all origins (*)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Default coordinates
+DEFAULT_LAT = "21.1458"
+DEFAULT_LON = "79.0882"
+# Active dark-store geofence coordinates fallback if local point is outside delivery zones
+ACTIVE_GEOFENCE_LAT = "28.6304"
+ACTIVE_GEOFENCE_LON = "77.2177"
+
+
+def calculate_unit_price(name: str, packsize: str, price: float) -> Dict[str, Any]:
+    """
+    Use regex to detect weights and volumes (kg, g, gm, l, ltr, ml).
+    Convert kg/L to 1000g/1000ml baseline, and compute normalized_price = round((price / base_units) * 100, 2)
+    per 100g or 100ml. If no unit matches, return price with unit "per pack".
+    """
+    if price is None or price <= 0:
+        return {"normalized_price": 0.0, "unit": "per pack", "formatted": "â‚¹0.00 / pack"}
+
+    combined = f"{name} {packsize}".lower()
+
+    # Multiplier pattern: e.g. "4 x 70 g", "2 x 500 ml", "2 x 200 ml"
+    mult_match = re.search(
+        r'(\d+)\s*[xX*]\s*(\d+(?:\.\d+)?)\s*(kg|kilo|kilogram|g|gm|gms|gram|l|ltr|litre|liter|ml)\b',
+        combined
+    )
+    if mult_match:
+        multiplier = float(mult_match.group(1))
+        qty = float(mult_match.group(2))
+        u = mult_match.group(3)
+        if u in ['kg', 'kilo', 'kilogram']:
+            base_units = multiplier * qty * 1000.0
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100g", "formatted": f"â‚¹{norm:.2f} / 100g"}
+        elif u in ['g', 'gm', 'gms', 'gram']:
+            base_units = multiplier * qty
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100g", "formatted": f"â‚¹{norm:.2f} / 100g"}
+        elif u in ['l', 'ltr', 'litre', 'liter']:
+            base_units = multiplier * qty * 1000.0
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100ml", "formatted": f"â‚¹{norm:.2f} / 100ml"}
+        elif u == 'ml':
+            base_units = multiplier * qty
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100ml", "formatted": f"â‚¹{norm:.2f} / 100ml"}
+
+    # Kilograms
+    kg_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:kg|kilo|kilogram)s?\b', combined)
+    if kg_match:
+        kg_val = float(kg_match.group(1))
+        base_units = kg_val * 1000.0
+        if base_units > 0:
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100g", "formatted": f"â‚¹{norm:.2f} / 100g"}
+
+    # Liters
+    l_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:l|ltr|litre|liter)s?\b', combined)
+    if l_match:
+        l_val = float(l_match.group(1))
+        base_units = l_val * 1000.0
+        if base_units > 0:
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100ml", "formatted": f"â‚¹{norm:.2f} / 100ml"}
+
+    # Milliliters
+    ml_match = re.search(r'(\d+(?:\.\d+)?)\s*ml\b', combined)
+    if ml_match:
+        base_units = float(ml_match.group(1))
+        if base_units > 0:
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100ml", "formatted": f"â‚¹{norm:.2f} / 100ml"}
+
+    # Grams
+    g_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:g|gm|gms|gram)s?\b', combined)
+    if g_match:
+        base_units = float(g_match.group(1))
+        if base_units > 0:
+            norm = round((price / base_units) * 100, 2)
+            return {"normalized_price": norm, "unit": "100g", "formatted": f"â‚¹{norm:.2f} / 100g"}
+
+    # Default fallback per pack
+    return {
+        "normalized_price": round(price, 2),
+        "unit": "per pack",
+        "formatted": f"â‚¹{price:.2f} / pack"
+    }
+
+
+def _get_blinkit_auth_key() -> str:
+    """
+    Obtains a temporary anonymous auth_key from Blinkit accounts API to authorize search requests.
+    """
+    try:
+        r = requests.post(
+            "https://blinkit.com/v2/accounts/auth_key/",
+            headers={
+                "app_client": "consumer_web",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            },
+            impersonate="chrome124",
+            timeout=5
+        )
+        if r.status_code == 200:
+            return r.json().get("auth_key", "")
+    except Exception as e:
+        logger.warning(f"Failed to obtain Blinkit auth_key: {e}")
+    return ""
+
+
+def fetch_blinkit_sync(query: str, lat: str, lon: str) -> List[Dict[str, Any]]:
+    """
+    Fetches real live search results from Blinkit layout search API using curl_cffi chrome124 impersonation.
+    Defensively traverses response snippets to locate product cards and items.
+    """
+    encoded_q = urllib.parse.quote(query)
+    auth_key = _get_blinkit_auth_key()
+
+    search_headers = {
+        "auth_key": auth_key,
+        "app_client": "consumer_web",
+        "platform": "desktop_web",
+        "lat": lat,
+        "lon": lon,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": f"https://blinkit.com/s/?q={encoded_q}",
+        "Origin": "https://blinkit.com"
+    }
+    body = {
+        "applied_filters": None,
+        "sort": "",
+        "postback_meta": {},
+        "previous_search_query": "",
+        "vertical_cards_processed": 0
+    }
+
+    url = f"https://blinkit.com/v1/layout/search?q={encoded_q}&search_type=type_to_search"
+    products = []
+
+    try:
+        r = requests.post(url, headers=search_headers, json=body, impersonate="chrome124", timeout=8)
+
+        # If Nagpur local coordinate is not serviceable by dark stores, fallback to active geofence
+        if r.status_code == 400 and "location not serviceable" in r.text:
+            logger.info(f"Blinkit location ({lat}, {lon}) outside active store geofence. Using active geofence ({ACTIVE_GEOFENCE_LAT}, {ACTIVE_GEOFENCE_LON}).")
+            search_headers["lat"] = ACTIVE_GEOFENCE_LAT
+            search_headers["lon"] = ACTIVE_GEOFENCE_LON
+            r = requests.post(url, headers=search_headers, json=body, impersonate="chrome124", timeout=8)
+
+        if r.status_code == 200:
+            data = r.json()
+            snippets = data.get("response", {}).get("snippets", [])
+            for s in snippets:
+                sd = s.get("data", {})
+                cart_item = sd.get("atc_action", {}).get("add_to_cart", {}).get("cart_item", {})
+                name = cart_item.get("product_name") or cart_item.get("display_name")
+                price = cart_item.get("price") or cart_item.get("mrp")
+                unit = cart_item.get("unit")
+
+                if not name and isinstance(sd.get("name"), dict):
+                    name = sd["name"].get("text")
+                elif not name and isinstance(sd.get("name"), str):
+                    name = sd["name"]
+
+                if not price and isinstance(sd.get("normal_price"), dict):
+                    ptxt = sd["normal_price"].get("text", "")
+                    num = re.sub(r'[^\d.]', '', ptxt)
+                    if num:
+                        price = float(num)
+                elif not price and isinstance(sd.get("normal_price"), (int, float)):
+                    price = float(sd["normal_price"])
+
+                if not unit and isinstance(sd.get("variant"), dict):
+                    unit = sd["variant"].get("text")
+                elif not unit and isinstance(sd.get("variant"), str):
+                    unit = sd["variant"]
+
+                img = (sd.get("image") or {}).get("url") or ""
+
+                if name and price:
+                    try:
+                        p_val = float(price)
+                        if p_val > 5000:
+                            p_val /= 100.0
+                        products.append({
+                            "name": name,
+                            "price": round(p_val, 2),
+                            "unit": str(unit or ""),
+                            "image_url": img,
+                            "store": "Blinkit"
+                        })
+                    except (ValueError, TypeError):
+                        pass
+
+            if products:
+                logger.info(f"Blinkit live scraper retrieved {len(products)} real products for '{query}'.")
+                return products
+        else:
+            logger.warning(f"Blinkit layout search returned status {r.status_code}: {r.text[:200]}")
+    except Exception as exc:
+        logger.warning(f"Blinkit request error: {exc}")
+
+    return products
+
+
+async def fetch_blinkit(query: str, lat: str, lon: str) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(fetch_blinkit_sync, query, lat, lon)
+
+
+def fetch_zepto_sync(
+    query: str,
+    lat: str,
+    lon: str,
+    x_zepto_cookie: Optional[str] = None
+) -> tuple[List[Dict[str, Any]], bool]:
+    """
+    Attempts to fetch live search results from Zepto search endpoints using curl_cffi with chrome124 impersonation.
+    Attaches X-Zepto-Cookie (harvested by Flutter WebView) if provided.
+    Returns (products, challenge_detected).
+    """
+    encoded_q = urllib.parse.quote(query)
+    headers = {
+        "Host": "www.zeptonow.com",
+        "Referer": "https://www.zeptonow.com/",
+        "Origin": "https://www.zeptonow.com",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "x-user-latitude": lat,
+        "x-user-longitude": lon,
+    }
+
+    if x_zepto_cookie:
+        headers["Cookie"] = x_zepto_cookie
+        logger.info(f"Attached X-Zepto-Cookie ({len(x_zepto_cookie)} chars) to Zepto request.")
+
+    urls_to_try = [
+        f"https://www.zeptonow.com/api/v1/search/products?query={encoded_q}",
+        f"https://www.zeptonow.com/search?query={encoded_q}"
+    ]
+
+    products = []
+    challenge_detected = False
+    for url in urls_to_try:
+        try:
+            r = requests.get(url, headers=headers, impersonate="chrome124", timeout=7)
+            if r.status_code == 200:
+                data = r.json()
+                raw_items = (
+                    data.get("products")
+                    or data.get("items")
+                    or (data.get("data") or {}).get("items")
+                    or (data.get("data") or {}).get("products")
+                    or []
+                )
+
+                # Also search inside widgets/layout if present
+                if not raw_items and "layout" in data:
+                    for widget in data.get("layout", []):
+                        items = widget.get("data", {}).get("items", [])
+                        if items:
+                            raw_items.extend(items)
+
+                for it in raw_items:
+                    if not isinstance(it, dict):
+                        continue
+                    name = it.get("name") or it.get("product_name") or it.get("title") or ""
+                    # Selling price (discounted_selling_price / 100 or mrp / 100)
+                    raw_price = it.get("discounted_selling_price") or it.get("selling_price") or it.get("mrp") or 0.0
+                    try:
+                        price = float(raw_price) / 100.0 if float(raw_price) > 500 else float(raw_price)
+                    except (ValueError, TypeError):
+                        price = 0.0
+
+                    unit = str(it.get("formatted_packsize") or it.get("packsize") or it.get("quantity") or "")
+                    img = it.get("image_url") or it.get("image") or ""
+
+                    if name and price > 0:
+                        products.append({
+                            "name": name,
+                            "price": round(price, 2),
+                            "unit": unit,
+                            "image_url": img,
+                            "store": "Zepto"
+                        })
+                if products:
+                    logger.info(f"Zepto live scraper retrieved {len(products)} real products for '{query}'.")
+                    return products, False
+            elif r.status_code in [202, 403, 405]:
+                logger.warning(f"Zepto endpoint '{url}' restricted by AWS WAF JavaScript challenge ({r.status_code}).")
+                challenge_detected = True
+            else:
+                logger.warning(f"Zepto endpoint '{url}' returned status {r.status_code}.")
+        except Exception as exc:
+            logger.warning(f"Zepto request error for '{url}': {exc}")
+
+    return products, challenge_detected
+
+
+async def fetch_zepto(
+    query: str,
+    lat: str,
+    lon: str,
+    x_zepto_cookie: Optional[str] = None
+) -> tuple[List[Dict[str, Any]], bool]:
+    return await asyncio.to_thread(fetch_zepto_sync, query, lat, lon, x_zepto_cookie)
+
+
+@app.get("/api/compare")
+async def compare_prices(
+    q: str = Query(..., description="Search query"),
+    lat: str = Query(DEFAULT_LAT, description="User latitude"),
+    lon: str = Query(DEFAULT_LON, description="User longitude"),
+    x_zepto_cookie: Optional[str] = Header(None, alias="X-Zepto-Cookie")
+):
+    """
+    Fires both live scrapers concurrently via asyncio.gather.
+    Fuzzy-matches items using thefuzz.token_sort_ratio with threshold >= 60.
+    Compares normalized unit prices.
+    Accepts X-Zepto-Cookie from client WebView to bypass AWS WAF.
+    """
+    cleaned_q = q.strip()
+    if not cleaned_q:
+        return {"query": q, "results": [], "raw_blinkit_count": 0, "raw_zepto_count": 0, "zepto_blocked": False}
+
+    # Execute both live scrapers concurrently
+    blinkit_task = fetch_blinkit(cleaned_q, lat, lon)
+    zepto_task = fetch_zepto(cleaned_q, lat, lon, x_zepto_cookie)
+    blinkit_items, (zepto_items, zepto_challenged) = await asyncio.gather(blinkit_task, zepto_task)
+
+    zepto_blocked = zepto_challenged and len(zepto_items) == 0
+
+    paired_results = []
+    used_zepto = set()
+
+    # Pair items if both platforms returned results
+    if blinkit_items and zepto_items:
+        for b_item in blinkit_items:
+            best_score = -1
+            best_z_idx = None
+            b_label = f"{b_item['name']} {b_item.get('unit', '')}".lower()
+
+            for z_idx, z_item in enumerate(zepto_items):
+                if z_idx in used_zepto:
+                    continue
+                z_label = f"{z_item['name']} {z_item.get('unit', '')}".lower()
+                score = fuzz.token_sort_ratio(b_label, z_label)
+                if score > best_score:
+                    best_score = score
+                    best_z_idx = z_idx
+
+            if best_z_idx is not None and best_score >= 60:
+                used_zepto.add(best_z_idx)
+                z_item = zepto_items[best_z_idx]
+
+                b_unit = calculate_unit_price(b_item["name"], b_item.get("unit", ""), b_item["price"])
+                z_unit = calculate_unit_price(z_item["name"], z_item.get("unit", ""), z_item["price"])
+
+                if b_unit["normalized_price"] < z_unit["normalized_price"]:
+                    cheaper = "Blinkit"
+                elif z_unit["normalized_price"] < b_unit["normalized_price"]:
+                    cheaper = "Zepto"
+                else:
+                    cheaper = "Equal"
+
+                paired_results.append({
+                    "name": b_item["name"],
+                    "packsize": b_item.get("unit") or z_item.get("unit", ""),
+                    "unit": b_unit["unit"],
+                    "match_score": best_score,
+                    "cheaper_store": cheaper,
+                    "blinkit": {
+                        "name": b_item["name"],
+                        "packsize": b_item.get("unit", ""),
+                        "price": b_item["price"],
+                        "normalized_price": b_unit["normalized_price"],
+                        "unit": b_unit["unit"],
+                        "formatted_unit_price": b_unit["formatted"],
+                        "buy_url": f"https://blinkit.com/s/?q={urllib.parse.quote(b_item['name'])}"
+                    },
+                    "zepto": {
+                        "name": z_item["name"],
+                        "packsize": z_item.get("unit", ""),
+                        "price": z_item["price"],
+                        "normalized_price": z_unit["normalized_price"],
+                        "unit": z_unit["unit"],
+                        "formatted_unit_price": z_unit["formatted"],
+                        "buy_url": f"https://www.zeptonow.com/search?query={urllib.parse.quote(z_item['name'])}"
+                    }
+                })
+            else:
+                # Unpaired Blinkit item
+                b_unit = calculate_unit_price(b_item["name"], b_item.get("unit", ""), b_item["price"])
+                paired_results.append({
+                    "name": b_item["name"],
+                    "packsize": b_item.get("unit", ""),
+                    "unit": b_unit["unit"],
+                    "match_score": 0,
+                    "cheaper_store": "Blinkit",
+                    "blinkit": {
+                        "name": b_item["name"],
+                        "packsize": b_item.get("unit", ""),
+                        "price": b_item["price"],
+                        "normalized_price": b_unit["normalized_price"],
+                        "unit": b_unit["unit"],
+                        "formatted_unit_price": b_unit["formatted"],
+                        "buy_url": f"https://blinkit.com/s/?q={urllib.parse.quote(b_item['name'])}"
+                    },
+                    "zepto": None
+                })
+    elif blinkit_items:
+        # Live items from Blinkit
+        for b_item in blinkit_items:
+            b_unit = calculate_unit_price(b_item["name"], b_item.get("unit", ""), b_item["price"])
+            paired_results.append({
+                "name": b_item["name"],
+                "packsize": b_item.get("unit", ""),
+                "unit": b_unit["unit"],
+                "match_score": 0,
+                "cheaper_store": "Blinkit",
+                "blinkit": {
+                    "name": b_item["name"],
+                    "packsize": b_item.get("unit", ""),
+                    "price": b_item["price"],
+                    "normalized_price": b_unit["normalized_price"],
+                    "unit": b_unit["unit"],
+                    "formatted_unit_price": b_unit["formatted"],
+                    "buy_url": f"https://blinkit.com/s/?q={urllib.parse.quote(b_item['name'])}"
+                },
+                "zepto": None
+            })
+    elif zepto_items:
+        # Live items from Zepto
+        for z_item in zepto_items:
+            z_unit = calculate_unit_price(z_item["name"], z_item.get("unit", ""), z_item["price"])
+            paired_results.append({
+                "name": z_item["name"],
+                "packsize": z_item.get("unit", ""),
+                "unit": z_unit["unit"],
+                "match_score": 0,
+                "cheaper_store": "Zepto",
+                "blinkit": None,
+                "zepto": {
+                    "name": z_item["name"],
+                    "packsize": z_item.get("unit", ""),
+                    "price": z_item["price"],
+                    "normalized_price": z_unit["normalized_price"],
+                    "unit": z_unit["unit"],
+                    "formatted_unit_price": z_unit["formatted"],
+                    "buy_url": f"https://www.zeptonow.com/search?query={urllib.parse.quote(z_item['name'])}"
+                }
+            })
+
+    return {
+        "query": cleaned_q,
+        "results": paired_results,
+        "raw_blinkit_count": len(blinkit_items),
+        "raw_zepto_count": len(zepto_items),
+        "zepto_blocked": zepto_blocked,
+        "has_zepto_cookie": bool(x_zepto_cookie)
+    }
+
+
+@app.get("/api/zepto-status")
+def zepto_status(x_zepto_cookie: Optional[str] = Header(None, alias="X-Zepto-Cookie")):
+    return {
+        "has_client_cookie": bool(x_zepto_cookie),
+        "cookie_length": len(x_zepto_cookie) if x_zepto_cookie else 0
+    }
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "ok",
+        "service": "live-quick-commerce-aggregator",
+        "version": "4.0.0"
+    }
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:geolocator/geolocator.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const QuickCompareApp());
+}
+
+class QuickCompareApp extends StatelessWidget {
+  const QuickCompareApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'QuickCompare',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF571E86),
+          primary: const Color(0xFF1F2937),
+          secondary: const Color(0xFFF8CB46),
+        ),
+        fontFamily: 'Roboto',
+      ),
+      home: const CompareHomePage(),
+    );
+  }
+}
+
+class StoreOffer {
+  final String name;
+  final String packsize;
+  final double price;
+  final double normalizedPrice;
+  final String unit;
+  final String formattedUnitPrice;
+  final String buyUrl;
+
+  StoreOffer({
+    required this.name,
+    required this.packsize,
+    required this.price,
+    required this.normalizedPrice,
+    required this.unit,
+    required this.formattedUnitPrice,
+    required this.buyUrl,
+  });
+
+  factory StoreOffer.fromJson(Map<String, dynamic> json) {
+    return StoreOffer(
+      name: json['name']?.toString() ?? '',
+      packsize: json['packsize']?.toString() ?? '',
+      price: (json['price'] as num?)?.toDouble() ?? 0.0,
+      normalizedPrice: (json['normalized_price'] as num?)?.toDouble() ?? 0.0,
+      unit: json['unit']?.toString() ?? '',
+      formattedUnitPrice: json['formatted_unit_price']?.toString() ?? '',
+      buyUrl: json['buy_url']?.toString() ?? '',
+    );
+  }
+}
+
+class ProductComparisonItem {
+  final String name;
+  final String packsize;
+  final String unit;
+  final int matchScore;
+  final String cheaperStore;
+  final StoreOffer? blinkit;
+  final StoreOffer? zepto;
+
+  ProductComparisonItem({
+    required this.name,
+    required this.packsize,
+    required this.unit,
+    required this.matchScore,
+    required this.cheaperStore,
+    this.blinkit,
+    this.zepto,
+  });
+
+  factory ProductComparisonItem.fromJson(Map<String, dynamic> json) {
+    return ProductComparisonItem(
+      name: json['name']?.toString() ?? '',
+      packsize: json['packsize']?.toString() ?? '',
+      unit: json['unit']?.toString() ?? '',
+      matchScore: (json['match_score'] as num?)?.toInt() ?? 0,
+      cheaperStore: json['cheaper_store']?.toString() ?? '',
+      blinkit: json['blinkit'] != null ? StoreOffer.fromJson(json['blinkit']) : null,
+      zepto: json['zepto'] != null ? StoreOffer.fromJson(json['zepto']) : null,
+    );
+  }
+}
+
+class CompareHomePage extends StatefulWidget {
+  const CompareHomePage({super.key});
+
+  @override
+  State<CompareHomePage> createState() => _CompareHomePageState();
+}
+
+class _CompareHomePageState extends State<CompareHomePage> {
+  final TextEditingController _searchController = TextEditingController(text: 'milk');
+  String _serverHost = '192.168.1.7'; // Laptop LAN IP (can be edited by user)
+  final String _serverPort = '8000';
+
+  double _latitude = 21.1458;
+  double _longitude = 79.0882;
+  String _locationStatus = 'Detecting GPS...';
+  bool _isGpsActive = false;
+
+  bool _isLoading = false;
+  String? _errorMessage;
+  List<ProductComparisonItem> _results = [];
+  int _rawBlinkitCount = 0;
+  int _rawZeptoCount = 0;
+
+  // Background WebView Harvester State
+  late final WebViewController _webViewController;
+  String _zeptoCookie = '';
+  bool _hasHarvestedCookie = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initWebViewController();
+    _initLocationAndFetch();
+  }
+
+  void _initWebViewController() {
+    _webViewController = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setUserAgent('Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36')
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String url) async {
+            await _harvestCookies();
+          },
+        ),
+      )
+      ..loadRequest(Uri.parse('https://www.zeptonow.com'));
+  }
+
+  Future<void> _harvestCookies() async {
+    try {
+      final result = await _webViewController.runJavaScriptReturningResult('document.cookie');
+      String cookieStr = result.toString().trim();
+      if (cookieStr.startsWith('"') && cookieStr.endsWith('"') && cookieStr.length >= 2) {
+        cookieStr = cookieStr.substring(1, cookieStr.length - 1);
+      }
+      cookieStr = cookieStr.replaceAll(r'\"', '"').replaceAll(r'\\', r'\');
+      if (cookieStr.isNotEmpty && cookieStr != 'null') {
+        if (mounted) {
+          setState(() {
+            _zeptoCookie = cookieStr;
+            _hasHarvestedCookie = true;
+          });
+        }
+        debugPrint('[WebView Harvester] Harvested cookie string (${cookieStr.length} chars)');
+      }
+    } catch (e) {
+      debugPrint('[WebView Harvester] Error reading document.cookie: $e');
+    }
+  }
+
+  Future<void> _initLocationAndFetch() async {
+    await _fetchCurrentLocation();
+    await _searchGroceries(_searchController.text.trim());
+  }
+
+  Future<void> _fetchCurrentLocation() async {
+    setState(() {
+      _locationStatus = 'Locating...';
+    });
+
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        setState(() {
+          _locationStatus = 'Nagpur (Default GPS off)';
+          _isGpsActive = false;
+        });
+        return;
+      }
+
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          setState(() {
+            _locationStatus = 'Nagpur (Permission denied)';
+            _isGpsActive = false;
+          });
+          return;
+        }
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        setState(() {
+          _locationStatus = 'Nagpur (Permission denied)';
+          _isGpsActive = false;
+        });
+        return;
+      }
+
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 8),
+      );
+
+      setState(() {
+        _latitude = position.latitude;
+        _longitude = position.longitude;
+        _locationStatus = '${_latitude.toStringAsFixed(3)}, ${_longitude.toStringAsFixed(3)}';
+        _isGpsActive = true;
+      });
+    } catch (e) {
+      setState(() {
+        _locationStatus = 'Nagpur (21.145, 79.088)';
+        _isGpsActive = false;
+      });
+    }
+  }
+
+  Future<void> _searchGroceries(String query, {bool isRetry = false}) async {
+    if (query.isEmpty) return;
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    final String encodedQuery = Uri.encodeComponent(query);
+    final String url = 'http://$_serverHost:$_serverPort/api/compare?q=$encodedQuery&lat=$_latitude&lon=$_longitude';
+
+    final headers = <String, String>{
+      'Accept': 'application/json',
+    };
+    if (_zeptoCookie.isNotEmpty) {
+      headers['X-Zepto-Cookie'] = _zeptoCookie;
+    }
+
+    try {
+      final response = await http.get(
+        Uri.parse(url),
+        headers: headers,
+      ).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+
+        // Self-healing: If Zepto was challenged / blocked, silently reload WebView and retry
+        if (!isRetry && data['zepto_blocked'] == true) {
+          debugPrint('[WebView Harvester] Zepto challenge detected. Silently reloading WebView and retrying...');
+          await _reloadAndRetry(query);
+          return;
+        }
+
+        final List<dynamic> rawList = data['results'] as List<dynamic>? ?? [];
+        final parsedItems = rawList.map((e) => ProductComparisonItem.fromJson(e as Map<String, dynamic>)).toList();
+
+        setState(() {
+          _results = parsedItems;
+          _rawBlinkitCount = (data['raw_blinkit_count'] as num?)?.toInt() ?? 0;
+          _rawZeptoCount = (data['raw_zepto_count'] as num?)?.toInt() ?? 0;
+          _isLoading = false;
+        });
+      } else if (response.statusCode == 403 && !isRetry) {
+        debugPrint('[WebView Harvester] 403 received from backend. Silently reloading WebView and retrying...');
+        await _reloadAndRetry(query);
+      } else {
+        setState(() {
+          _errorMessage = 'Server error (${response.statusCode}): ${response.reasonPhrase}';
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _errorMessage = 'Could not reach backend at $url\n\nEnsure laptop and phone are on the same Wi-Fi and server.py is running on port 8000.';
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _reloadAndRetry(String query) async {
+    try {
+      await _webViewController.reload();
+      await Future.delayed(const Duration(seconds: 3));
+      await _harvestCookies();
+      await _searchGroceries(query, isRetry: true);
+    } catch (e) {
+      debugPrint('[WebView Harvester] Error in reload and retry: $e');
+    }
+  }
+
+  Future<void> _openBuyLink(String url) async {
+    if (url.isEmpty) return;
+    final Uri uri = Uri.parse(url);
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not open link: $e')),
+        );
+      }
+    }
+  }
+
+  void _showServerConfigDialog() {
+    final controller = TextEditingController(text: _serverHost);
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Backend Server IP'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter your laptop LAN IP address (or 10.0.2.2 for Android emulator):',
+              style: TextStyle(fontSize: 13, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                labelText: 'Host IP',
+                prefixText: 'http://',
+                suffixText: ':8000',
+              ),
+              keyboardType: TextInputType.datetime,
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                ActionChip(
+                  label: const Text('192.168.1.7 (Wi-Fi)'),
+                  onPressed: () => controller.text = '192.168.1.7',
+                ),
+                ActionChip(
+                  label: const Text('10.0.2.2 (Emulator)'),
+                  onPressed: () => controller.text = '10.0.2.2',
+                ),
+              ],
+            )
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              setState(() {
+                _serverHost = controller.text.trim();
+              });
+              Navigator.pop(context);
+              _searchGroceries(_searchController.text.trim());
+            },
+            child: const Text('Save & Reconnect'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showZeptoLoginModal(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (bottomSheetCtx) {
+        return _ZeptoLoginBottomSheet(
+          serverHost: _serverHost,
+          serverPort: _serverPort,
+          onLoginSuccess: () {
+            setState(() {
+              _isZeptoLinked = true;
+            });
+            _searchGroceries(_searchController.text.trim());
+          },
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8FAFC),
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 0.5,
+        titleSpacing: 12,
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(5),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFFF59E0B), Color(0xFFEC4899), Color(0xFF6B21A8)],
+                ),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: const Text('âš¡', style: TextStyle(fontSize: 12)),
+            ),
+            const SizedBox(width: 8),
+            const Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'QuickCompare',
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: Color(0xFF0F172A)),
+                  ),
+                  Text(
+                    'Blinkit vs Zepto',
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _isZeptoLinked ? const Color(0xFF10B981) : const Color(0xFF571E86),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+                minimumSize: const Size(0, 32),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                elevation: 0,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              icon: Icon(
+                _isZeptoLinked ? Icons.check_circle_rounded : Icons.phone_android_rounded,
+                size: 13,
+              ),
+              label: Text(
+                _isZeptoLinked ? 'Linked' : 'Link Zepto',
+                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+              ),
+              onPressed: () => _showZeptoLoginModal(context),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.dns_rounded, size: 18, color: Color(0xFF475569)),
+            tooltip: 'Server IP: $_serverHost:$_serverPort',
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            padding: EdgeInsets.zero,
+            onPressed: _showServerConfigDialog,
+          ),
+          IconButton(
+            icon: const Icon(Icons.my_location_rounded, size: 18, color: Color(0xFF475569)),
+            tooltip: 'Refresh Location',
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            padding: EdgeInsets.zero,
+            onPressed: _fetchCurrentLocation,
+          ),
+          const SizedBox(width: 4),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Search & Filters Header
+          Container(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              border: Border(bottom: BorderSide(color: Color(0xFFE2E8F0))),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // GPS and Server Status Bar
+                Row(
+                  children: [
+                    Flexible(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: _isGpsActive ? const Color(0xFFECFDF5) : const Color(0xFFF1F5F9),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: _isGpsActive ? const Color(0xFFA7F3D0) : const Color(0xFFE2E8F0),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.location_on,
+                              size: 13,
+                              color: _isGpsActive ? const Color(0xFF059669) : Colors.grey,
+                            ),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                _locationStatus,
+                                overflow: TextOverflow.ellipsis,
+                                maxLines: 1,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: _isGpsActive ? const Color(0xFF065F46) : const Color(0xFF475569),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    GestureDetector(
+                      onTap: _showServerConfigDialog,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF1F5F9),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.wifi, size: 11, color: Color(0xFF64748B)),
+                            const SizedBox(width: 3),
+                            Text(
+                              '$_serverHost:$_serverPort',
+                              style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.w500),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+
+                // Search Bar Input
+                Row(
+                  children: [
+                    Expanded(
+                      child: Container(
+                        height: 48,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF1F5F9),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: const Color(0xFFCBD5E1)),
+                        ),
+                        child: TextField(
+                          controller: _searchController,
+                          textInputAction: TextInputAction.search,
+                          onSubmitted: (value) => _searchGroceries(value.trim()),
+                          decoration: InputDecoration(
+                            hintText: 'Search milk, bread, butter, eggs...',
+                            hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
+                            prefixIcon: const Icon(Icons.search, size: 20, color: Color(0xFF64748B)),
+                            suffixIcon: _searchController.text.isNotEmpty
+                                ? IconButton(
+                                    icon: const Icon(Icons.clear, size: 18),
+                                    onPressed: () {
+                                      _searchController.clear();
+                                      setState(() {});
+                                    },
+                                  )
+                                : null,
+                            border: InputBorder.none,
+                            contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0F172A),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleSpring(borderRadius: BorderRadius.circular(12)),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                      ),
+                      onPressed: _isLoading ? null : () => _searchGroceries(_searchController.text.trim()),
+                      child: _isLoading
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Text('Compare', style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+
+                // Quick Chips
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: ['milk', 'bread', 'butter', 'eggs', 'atta', 'coke'].map((term) {
+                      return Padding(
+                        padding: const EdgeInsets.only(right: 6),
+                        child: ActionChip(
+                          label: Text(term, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
+                          backgroundColor: Colors.white,
+                          side: const BorderSide(color: Color(0xFFE2E8F0)),
+                          onPressed: () {
+                            _searchController.text = term;
+                            _searchGroceries(term);
+                          },
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Content Body
+          Expanded(
+            child: _isLoading
+                ? const Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        CircularProgressIndicator(color: Color(0xFF571E86)),
+                        SizedBox(height: 16),
+                        Text('Fetching real-time prices...', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                      ],
+                    ),
+                  )
+                : _errorMessage != null
+                    ? _buildErrorView()
+                    : _results.isEmpty
+                        ? _buildEmptyView()
+                        : _buildResultsList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildErrorView() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.wifi_off_rounded, size: 48, color: Color(0xFFE11D48)),
+            const SizedBox(height: 12),
+            const Text(
+              'Connection Error',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF0F172A)),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _errorMessage ?? '',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: () => _searchGroceries(_searchController.text.trim()),
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('Try Again'),
+            ),
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: _showServerConfigDialog,
+              child: const Text('Change Server IP'),
+            )
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyView() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.search_off_rounded, size: 48, color: Colors.grey),
+            const SizedBox(height: 12),
+            const Text(
+              'No Products Found',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Blinkit: $_rawBlinkitCount items | Zepto: $_rawZeptoCount items.\nTry standard items like milk, bread, or butter.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildResultsList() {
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      itemCount: _results.length,
+      itemBuilder: (context, index) {
+        final item = _results[index];
+        return _buildComparisonCard(item);
+      },
+    );
+  }
+
+  Widget _buildComparisonCard(ProductComparisonItem item) {
+    final bool hasBlinkit = item.blinkit != null;
+    final bool hasZepto = item.zepto != null;
+    final bool isBlinkitCheapest = item.cheaperStore == 'Blinkit' && hasZepto;
+    final bool isZeptoCheapest = item.cheaperStore == 'Zepto' && hasBlinkit;
+    final bool isEqual = item.cheaperStore == 'Equal' && hasBlinkit && hasZepto;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      elevation: 0.5,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: const BorderSide(color: Color(0xFFE2E8F0)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Card Header
+          Container(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+            color: const Color(0xFFF8FAFC),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.name,
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF0F172A)),
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          if (item.packsize.isNotEmpty)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFE2E8F0),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                item.packsize,
+                                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF334155)),
+                              ),
+                            ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Unit: ${item.unit}',
+                            style: const TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                if (isEqual)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F5F9),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFFCBD5E1)),
+                    ),
+                    child: const Text('âš–ï¸ Equal', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                  ),
+              ],
+            ),
+          ),
+
+          // Side-by-side comparison
+          IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Blinkit Store Column
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: isBlinkitCheapest ? const Color(0xFFECFDF5) : Colors.white,
+                      border: Border(
+                        right: const BorderSide(color: Color(0xFFF1F5F9)),
+                        bottom: isBlinkitCheapest ? const BorderSide(color: Color(0xFF10B981), width: 2) : BorderSide.none,
+                      ),
+                    ),
+                    child: _buildStoreSection(
+                      storeName: 'Blinkit',
+                      brandColor: const Color(0xFFF8CB46),
+                      textColor: const Color(0xFF78350F),
+                      logoChar: 'B',
+                      offer: item.blinkit,
+                      isCheapest: isBlinkitCheapest,
+                      fallbackBuyQuery: item.name,
+                      isBlinkit: true,
+                    ),
+                  ),
+                ),
+
+                // Zepto Store Column
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: isZeptoCheapest ? const Color(0xFFECFDF5) : Colors.white,
+                      border: Border(
+                        bottom: isZeptoCheapest ? const BorderSide(color: Color(0xFF10B981), width: 2) : BorderSide.none,
+                      ),
+                    ),
+                    child: _buildStoreSection(
+                      storeName: 'Zepto',
+                      brandColor: const Color(0xFF571E86),
+                      textColor: Colors.white,
+                      logoChar: 'Z',
+                      offer: item.zepto,
+                      isCheapest: isZeptoCheapest,
+                      fallbackBuyQuery: item.name,
+                      isBlinkit: false,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStoreSection({
+    required String storeName,
+    required Color brandColor,
+    required Color textColor,
+    required String logoChar,
+    required StoreOffer? offer,
+    required bool isCheapest,
+    required String fallbackBuyQuery,
+    required bool isBlinkit,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Store Title Row + CHEAPEST badge
+            Row(
+              children: [
+                Container(
+                  width: 20,
+                  height: 20,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: brandColor,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    logoChar,
+                    style: TextStyle(fontWeight: FontWeight.w900, fontSize: 11, color: textColor),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  storeName,
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12, color: Color(0xFF0F172A)),
+                ),
+                const Spacer(),
+                if (isCheapest)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF059669),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: const Text(
+                      'CHEAPEST',
+                      style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w900, letterSpacing: 0.3),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+
+            if (offer != null) ...[
+              // Price and unit price
+              Text(
+                'â‚¹${offer.price.toStringAsFixed(2)}',
+                style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 18, color: Color(0xFF0F172A)),
+              ),
+              const SizedBox(height: 2),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: isCheapest ? const Color(0xFFD1FAE5) : const Color(0xFFF1F5F9),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(
+                    color: isCheapest ? const Color(0xFFA7F3D0) : const Color(0xFFE2E8F0),
+                  ),
+                ),
+                child: Text(
+                  offer.formattedUnitPrice,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    color: isCheapest ? const Color(0xFF065F46) : const Color(0xFF475569),
+                  ),
+                ),
+              ),
+            ] else ...[
+              const SizedBox(height: 6),
+              Text(
+                isBlinkit ? 'Not listed on Blinkit' : 'WAF challenge on live API',
+                style: const TextStyle(fontSize: 10, color: Color(0xFF94A3B8), fontStyle: FontStyle.italic),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 12),
+
+        // Action Button
+        SizedBox(
+          width: double.infinity,
+          height: 34,
+          child: ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isBlinkit ? const Color(0xFFF8CB46) : const Color(0xFF571E86),
+              foregroundColor: isBlinkit ? const Color(0xFF0F172A) : Colors.white,
+              elevation: 0,
+              padding: EdgeInsets.zero,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            onPressed: () {
+              final String targetUrl = offer != null && offer.buyUrl.isNotEmpty
+                  ? offer.buyUrl
+                  : isBlinkit
+                      ? 'https://blinkit.com/s/?q=${Uri.encodeComponent(fallbackBuyQuery)}'
+                      : 'https://www.zeptonow.com/search?query=${Uri.encodeComponent(fallbackBuyQuery)}';
+              _openBuyLink(targetUrl);
+            },
+            child: Text(
+              'Buy on $storeName â†—',
+              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class RoundedRectangleSpring extends RoundedRectangleBorder {
+  const RoundedRectangleSpring({super.borderRadius});
+}
+
+class _ZeptoLoginBottomSheet extends StatefulWidget {
+  final String serverHost;
+  final String serverPort;
+  final VoidCallback onLoginSuccess;
+
+  const _ZeptoLoginBottomSheet({
+    required this.serverHost,
+    required this.serverPort,
+    required this.onLoginSuccess,
+  });
+
+  @override
+  State<_ZeptoLoginBottomSheet> createState() => _ZeptoLoginBottomSheetState();
+}
+
+class _ZeptoLoginBottomSheetState extends State<_ZeptoLoginBottomSheet> {
+  int _stage = 1; // 1: Enter Phone, 2: Enter OTP
+  final TextEditingController _phoneController = TextEditingController();
+  final TextEditingController _otpController = TextEditingController();
+
+  bool _isLoading = false;
+  String? _errorMessage;
+  String? _infoMessage;
+
+  @override
+  void dispose() {
+    _phoneController.dispose();
+    _otpController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendOtp() async {
+    final phone = _phoneController.text.trim();
+    final digits = phone.replaceAll(RegExp(r'\D'), '');
+    final cleanPhone = digits.startsWith('91') && digits.length == 12 ? digits.substring(2) : digits;
+
+    if (cleanPhone.length != 10) {
+      setState(() {
+        _errorMessage = 'Please enter a valid 10-digit mobile number';
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+      _infoMessage = null;
+    });
+
+    final url = 'http://${widget.serverHost}:${widget.serverPort}/api/auth/zepto/send-otp';
+    try {
+      final res = await http.post(
+        Uri.parse(url),
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+        body: jsonEncode({'phone': cleanPhone}),
+      ).timeout(const Duration(seconds: 12));
+
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      if (res.statusCode == 200 && data['status'] == 'success') {
+        setState(() {
+          _stage = 2;
+          _isLoading = false;
+          _infoMessage = data['message'] ?? 'OTP sent to +91 $cleanPhone';
+        });
+      } else {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = data['message'] ?? 'Failed to send OTP (Status ${res.statusCode})';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+        _errorMessage = 'Connection error: Could not reach backend at $url';
+      });
+    }
+  }
+
+  Future<void> _verifyOtp() async {
+    final phone = _phoneController.text.trim();
+    final digits = phone.replaceAll(RegExp(r'\D'), '');
+    final cleanPhone = digits.startsWith('91') && digits.length == 12 ? digits.substring(2) : digits;
+    final otp = _otpController.text.trim();
+
+    if (otp.isEmpty || otp.length < 4) {
+      setState(() {
+        _errorMessage = 'Please enter the 4-digit OTP';
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+      _infoMessage = null;
+    });
+
+    final url = 'http://${widget.serverHost}:${widget.serverPort}/api/auth/zepto/verify-otp';
+    try {
+      final res = await http.post(
+        Uri.parse(url),
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+        body: jsonEncode({'phone': cleanPhone, 'otp': otp}),
+      ).timeout(const Duration(seconds: 12));
+
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      if (res.statusCode == 200 && data['status'] == 'success') {
+        setState(() {
+          _isLoading = false;
+        });
+        if (mounted) {
+          Navigator.pop(context);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Row(
+                children: [
+                  Icon(Icons.check_circle, color: Colors.white, size: 20),
+                  SizedBox(width: 8),
+                  Text('Zepto Linked! Showing live prices.', style: TextStyle(fontWeight: FontWeight.bold)),
+                ],
+              ),
+              backgroundColor: const Color(0xFF059669),
+              duration: const Duration(seconds: 3),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+          );
+        }
+        widget.onLoginSuccess();
+      } else {
+        setState(() {
+          _isLoading = false;
+          _errorMessage = data['message'] ?? 'Invalid OTP code';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+        _errorMessage = 'Verification error: Could not reach backend at $url';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedPadding(
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOut,
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black26,
+              blurRadius: 20,
+              offset: Offset(0, -4),
+            )
+          ],
+        ),
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 28),
+        child: SingleChildScrollView(
+          physics: const ClampingScrollPhysics(),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+            // Drag handle
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 20),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+
+            // Header with Zepto branding
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF571E86),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Text(
+                    'ZEPTO',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1.2,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    _stage == 1 ? 'Link Zepto Account' : 'Verify Zepto OTP',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF0F172A),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.grey),
+                  onPressed: () => Navigator.pop(context),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _stage == 1
+                  ? 'Enter your mobile number to bypass WAF challenges & unlock live member prices.'
+                  : 'Enter the 4-digit verification code sent to your mobile.',
+              style: TextStyle(fontSize: 13, color: Colors.grey.shade600, height: 1.4),
+            ),
+            const SizedBox(height: 20),
+
+            // Error or info message
+            if (_errorMessage != null)
+              Container(
+                margin: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFEF2F2),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFFCA5A5)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.error_outline_rounded, color: Color(0xFFDC2626), size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _errorMessage!,
+                        style: const TextStyle(color: Color(0xFFDC2626), fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+            if (_infoMessage != null)
+              Container(
+                margin: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF0FDF4),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFF86EFAC)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.check_circle_outline_rounded, color: Color(0xFF16A34A), size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _infoMessage!,
+                        style: const TextStyle(color: Color(0xFF16A34A), fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+            // Stage 1: Phone input
+            if (_stage == 1) ...[
+              TextField(
+                controller: _phoneController,
+                keyboardType: TextInputType.phone,
+                maxLength: 10,
+                autofocus: true,
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, letterSpacing: 1),
+                decoration: InputDecoration(
+                  counterText: '',
+                  prefixIcon: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text('ðŸ‡®ðŸ‡³', style: TextStyle(fontSize: 18)),
+                        SizedBox(width: 6),
+                        Text(
+                          '+91',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Color(0xFF1E293B)),
+                        ),
+                        SizedBox(width: 8),
+                        SizedBox(height: 20, child: VerticalDivider(color: Colors.grey, thickness: 1)),
+                      ],
+                    ),
+                  ),
+                  hintText: '9876543210',
+                  hintStyle: TextStyle(color: Colors.grey.shade400, fontWeight: FontWeight.normal),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(color: Colors.grey.shade300),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: Color(0xFF571E86), width: 2),
+                  ),
+                  filled: true,
+                  fillColor: const Color(0xFFF8FAFC),
+                ),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF571E86),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  elevation: 0,
+                ),
+                onPressed: _isLoading ? null : _sendOtp,
+                child: _isLoading
+                    ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Text(
+                        'Send OTP',
+                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                      ),
+              ),
+            ],
+
+            // Stage 2: OTP input
+            if (_stage == 2) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Sent to +91 ${_phoneController.text.trim()}',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Color(0xFF334155)),
+                  ),
+                  TextButton(
+                    onPressed: _isLoading
+                        ? null
+                        : () {
+                            setState(() {
+                              _stage = 1;
+                              _errorMessage = null;
+                              _infoMessage = null;
+                            });
+                          },
+                    child: const Text('Change Number', style: TextStyle(fontSize: 12, color: Color(0xFF571E86))),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _otpController,
+                keyboardType: TextInputType.number,
+                maxLength: 6,
+                autofocus: true,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 12,
+                  color: Color(0xFF571E86),
+                ),
+                decoration: InputDecoration(
+                  counterText: '',
+                  hintText: 'â€¢â€¢â€¢â€¢',
+                  hintStyle: TextStyle(
+                    fontSize: 26,
+                    letterSpacing: 12,
+                    color: Colors.grey.shade400,
+                  ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide(color: Colors.grey.shade300),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: Color(0xFF571E86), width: 2),
+                  ),
+                  filled: true,
+                  fillColor: const Color(0xFFF8FAFC),
+                ),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF571E86),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  elevation: 0,
+                ),
+                onPressed: _isLoading ? null : _verifyOtp,
+                child: _isLoading
+                    ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Text(
+                        'Verify & Link',
+                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                      ),
+              ),
+              const SizedBox(height: 8),
+              Center(
+                child: TextButton(
+                  onPressed: _isLoading ? null : _sendOtp,
+                  child: const Text(
+                    'Resend OTP',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    ),
+  );
+  }
+}
+
