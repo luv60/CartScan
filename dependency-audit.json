@@ -1,0 +1,254 @@
+{
+  "python_files": [
+    "blinkit_service.py",
+    "blinkit_service_before_location_fix.py",
+    "blinkit_service_fast_test.py",
+    "check_env.py",
+    "debug_scraper.py",
+    "diagnose_zepto_py",
+    "inspect_blinkit_dom.py",
+    "instamart_probe.py",
+    "instamart_service.py",
+    "probe.py",
+    "probe_blinkit_400.py",
+    "probe_blinkit_autosuggest.py",
+    "probe_blinkit_browser_search.py",
+    "probe_blinkit_coordinates.py",
+    "probe_blinkit_fast.py",
+    "probe_blinkit_geolocation_override.py",
+    "probe_blinkit_layout.py",
+    "probe_blinkit_location.py",
+    "probe_blinkit_pagination.py",
+    "probe_blinkit_pagination_state.py",
+    "probe_blinkit_place.py",
+    "probe_blinkit_search.py",
+    "probe_blinkit_search_browser.py",
+    "probe_blinkit_search_click.py",
+    "probe_blinkit_search_dom.py",
+    "probe_blinkit_visibility.py",
+    "probe_blinkit_visibility_browser.py",
+    "probe_zepto.py",
+    "probe_zepto_coordinates.py",
+    "probe_zepto_location.py",
+    "probe_zepto_location_search.py",
+    "probe_zepto_location_ui.py",
+    "probe_zepto_playwright.py",
+    "probe_zepto_search.py",
+    "probe_zepto_unservicable.py",
+    "quickcompare_v9_live.py",
+    "quickcompare_v9_live_instrumented.py",
+    "quickcompare_v9_live_instrumented_new.py",
+    "quickcompare_v9_live_shared_model.py",
+    "server before product matcher implement.py",
+    "server without json .py",
+    "server.py",
+    "test_blinkit_coordinate_grid.py",
+    "test_blinkit_coordinate_serviceability.py",
+    "test_blinkit_geolocation.py",
+    "test_blinkit_location_click.py",
+    "test_blinkit_location_events.py",
+    "test_blinkit_location_network.py",
+    "test_blinkit_location_patch.py",
+    "test_im.py",
+    "test_matcher.py",
+    "test_original_blinkit.py",
+    "test_playwright.py",
+    "test_server_caching.py",
+    "test_v9_live.py",
+    "test_v9_matcher.py",
+    "test_zepto_retries.py",
+    "zepto_service before product matching.py",
+    "zepto_service.py",
+    "quickcompare_matcher_v9_eval\\product_matcher_v6.py",
+    "quickcompare_matcher_v9_eval\\product_matcher_v7.py",
+    "quickcompare_matcher_v9_eval\\product_matcher_v8.py",
+    "quick_compare_app\\ios\\Flutter\\ephemeral\\flutter_lldb_helper.py"
+  ],
+  "imports": {
+    "blinkit_service": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "test_original_blinkit.py"
+    ],
+    "cachetools": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "test_server_caching.py"
+    ],
+    "curl_cffi": [
+      "blinkit_service.py",
+      "blinkit_service_before_location_fix.py",
+      "blinkit_service_fast_test.py",
+      "debug_scraper.py",
+      "diagnose_zepto_py",
+      "probe.py",
+      "probe_blinkit_400.py",
+      "probe_blinkit_autosuggest.py",
+      "probe_blinkit_place.py",
+      "probe_blinkit_search.py",
+      "probe_blinkit_visibility.py",
+      "probe_zepto.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "test_im.py"
+    ],
+    "fastapi": [
+      "blinkit_service.py",
+      "blinkit_service_before_location_fix.py",
+      "blinkit_service_fast_test.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "test_server_caching.py",
+      "zepto_service before product matching.py",
+      "zepto_service.py"
+    ],
+    "instamart_service": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py"
+    ],
+    "joblib": [
+      "quickcompare_matcher_v9_eval\\product_matcher_v8.py",
+      "quickcompare_v9_live.py",
+      "quickcompare_v9_live_instrumented.py",
+      "quickcompare_v9_live_instrumented_new.py",
+      "quickcompare_v9_live_shared_model.py",
+      "test_v9_matcher.py"
+    ],
+    "lldb": [
+      "quick_compare_app\\ios\\Flutter\\ephemeral\\flutter_lldb_helper.py"
+    ],
+    "numpy": [
+      "quickcompare_matcher_v9_eval\\product_matcher_v7.py",
+      "quickcompare_matcher_v9_eval\\product_matcher_v8.py",
+      "quickcompare_v9_live.py"
+    ],
+    "playwright": [
+      "blinkit_service.py",
+      "blinkit_service_fast_test.py",
+      "check_env.py",
+      "inspect_blinkit_dom.py",
+      "instamart_probe.py",
+      "instamart_service.py",
+      "probe_blinkit_browser_search.py",
+      "probe_blinkit_coordinates.py",
+      "probe_blinkit_fast.py",
+      "probe_blinkit_geolocation_override.py",
+      "probe_blinkit_layout.py",
+      "probe_blinkit_location.py",
+      "probe_blinkit_pagination.py",
+      "probe_blinkit_pagination_state.py",
+      "probe_blinkit_search_browser.py",
+      "probe_blinkit_search_click.py",
+      "probe_blinkit_search_dom.py",
+      "probe_blinkit_visibility_browser.py",
+      "probe_zepto_coordinates.py",
+      "probe_zepto_location.py",
+      "probe_zepto_location_search.py",
+      "probe_zepto_location_ui.py",
+      "probe_zepto_playwright.py",
+      "probe_zepto_search.py",
+      "probe_zepto_unservicable.py",
+      "test_blinkit_coordinate_grid.py",
+      "test_blinkit_coordinate_serviceability.py",
+      "test_blinkit_geolocation.py",
+      "test_blinkit_location_click.py",
+      "test_blinkit_location_events.py",
+      "test_blinkit_location_network.py",
+      "test_blinkit_location_patch.py",
+      "test_playwright.py",
+      "zepto_service before product matching.py",
+      "zepto_service.py"
+    ],
+    "product_matcher_v6": [
+      "quickcompare_matcher_v9_eval\\product_matcher_v7.py",
+      "quickcompare_matcher_v9_eval\\product_matcher_v8.py",
+      "test_v9_matcher.py"
+    ],
+    "product_matcher_v7": [
+      "test_v9_matcher.py"
+    ],
+    "product_matcher_v8": [
+      "test_v9_matcher.py"
+    ],
+    "pydantic": [
+      "blinkit_service.py",
+      "blinkit_service_before_location_fix.py",
+      "blinkit_service_fast_test.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "zepto_service before product matching.py",
+      "zepto_service.py"
+    ],
+    "quickcompare_v9_live": [
+      "server.py",
+      "test_v9_live.py"
+    ],
+    "rapidfuzz": [
+      "quickcompare_matcher_v9_eval\\product_matcher_v6.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "test_matcher.py"
+    ],
+    "redis": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py"
+    ],
+    "seleniumbase": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py"
+    ],
+    "sentence_transformers": [
+      "check_env.py",
+      "quickcompare_matcher_v9_eval\\product_matcher_v7.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py"
+    ],
+    "server": [
+      "test_matcher.py",
+      "test_server_caching.py"
+    ],
+    "sklearn": [
+      "quickcompare_matcher_v9_eval\\product_matcher_v7.py",
+      "quickcompare_matcher_v9_eval\\product_matcher_v8.py",
+      "quickcompare_v9_live.py"
+    ],
+    "starlette": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py"
+    ],
+    "thefuzz": [
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py"
+    ],
+    "uvicorn": [
+      "blinkit_service.py",
+      "blinkit_service_before_location_fix.py",
+      "blinkit_service_fast_test.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "zepto_service before product matching.py",
+      "zepto_service.py"
+    ],
+    "zepto_service": [
+      "probe_zepto.py",
+      "server before product matcher implement.py",
+      "server without json .py",
+      "server.py",
+      "test_zepto_retries.py"
+    ]
+  },
+  "parse_errors": []
+}

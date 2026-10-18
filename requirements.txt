@@ -1,0 +1,21 @@
+# QuickCompare backend dependencies
+# Runtime and diagnostic dependencies, including the V6/V7/V8/V9 matcher.
+
+cachetools
+curl_cffi
+fastapi
+httpx
+joblib
+numpy
+pillow
+playwright
+pydantic
+rapidfuzz
+redis
+seleniumbase
+scikit-learn
+sentence-transformers
+starlette
+thefuzz
+uvicorn
+torch

@@ -1,0 +1,32 @@
+from curl_cffi import requests
+
+def run_diagnostic():
+    session = requests.Session(impersonate="chrome120")
+    lat, lon = 21.1762179, 79.0554159
+    store_id = "e9b25f0e-d7f4-42b7-a3f2-89b9d31317d7"
+    query = "milk"
+
+    print(f"--- 1. Fetching Zepto Search for '{query}' ---")
+    search_url = "https://bff-gateway.zepto.com/user-search-service/api/v3/search"
+    
+    try:
+        res = session.post(
+            search_url,
+            json={"query": query, "pageNumber": 0, "mode": "SHOW_ALL_RESULTS", "userSessionId": ""},
+            headers={
+                "tenant_id": "ZEPTO",
+                "store_id": store_id,
+                "x-store-id": store_id,
+                "Content-Type": "application/json"
+            },
+            timeout=10
+        )
+        
+        print(f"HTTP Status Code: {res.status_code}")
+        print(f"Raw Response Body: {res.text[:800]}")  # Print first 800 chars to avoid terminal spam
+        
+    except Exception as e:
+        print(f"Network Failure: {e}")
+
+if __name__ == "__main__":
+    run_diagnostic()
